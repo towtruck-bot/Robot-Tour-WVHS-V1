@@ -1,7 +1,41 @@
-#include <Wire.h>
-#include <Adafruit_LSM6DS3TRC.h>
+// ========== COMBINED ROBOT CONTROL ==========
+// Adjusted for 113.5mm wheel-to-wheel diameter
 
-// --- Pins ---
+// ========== CALIBRATION ==========
+const float WHEEL_DIAMETER_MM = 60.325;
+const int PULSES_PER_REV = 435;
+const float WHEEL_BASE_MM = 113.5;  // NEW: Updated wheel-to-wheel diameter
+
+// Straight driving - YOUR ORIGINAL SETTINGS with 95 speed
+const int BASE_SPEED = 95;
+const int MAX_SPEED = 255;
+
+// Straight PID - YOUR ORIGINAL
+const float KP = 8.0;
+const float KI = 0.5;
+const float KD = 2.0;
+const int POSITION_TOLERANCE = 2;
+
+// Turn speed - BOOSTED for left turn
+const int TURN_SPEED_MAX = 140;
+const int TURN_SPEED_MIN = 110;
+
+// Left turn boost - extra power
+const int LEFT_TURN_SPEED_MAX = 200;
+const int LEFT_TURN_SPEED_MIN = 160;
+
+// Motor bias - YOUR ORIGINAL
+const float RIGHT_MOTOR_BIAS = 1.15;
+
+// Turn calibration multipliers (adjusted for 113.5mm wheelbase)
+const float TURN_MULTIPLIER_RIGHT = 0.626;  // Adjusted: 0.643 * (113.5/110.5)
+const float TURN_MULTIPLIER_LEFT = 0.52;   // Adjusted: 0.6365 * (113.5/110.5)
+
+// Ramping - YOUR ORIGINAL
+const int TURN_ACCEL_MS = 400;
+const int TURN_DECEL_TICKS = 30;
+
+// ========== PINS ==========
 #define encAL 2
 #define encBL 4
 #define encAR 3
@@ -13,35 +47,15 @@
 #define ENA 6
 #define ENB 5
 
-// --- Encoder State ---
+// ========== STATE ==========
 volatile long rCnt = 0, lCnt = 0;
 volatile int lastAR = LOW, lastAL = LOW;
 
-// --- IMU ---
-Adafruit_LSM6DS3TRC imu;
-bool imuOK = false;
+float mm_per_tick;
+float error_sum = 0;
+float last_error = 0;
 
-// --- PID ---
-float Kp_spd = 3.0, Ki_spd = 1.0, Kd_spd = 0.4;
-float Kp_hdg = 25.0, Ki_hdg = 5.0, Kd_hdg = 3.0;  // Much stronger heading correction
-float spdErr = 0, spdErrLast = 0, spdErrSum = 0;
-float hdgErr = 0, hdgErrLast = 0, hdgErrSum = 0;
-
-// --- Control ---
-int baseSpd = 180;   // Reduced from 255
-int maxSpd = 255;
-int startBoost = 200;  // Reduced from 255
-int startDur = 200;    // Reduced from 500ms
-int rightBias = -18;
-// --- Heading ---
-float heading = 0.0;
-float targetHeading = 0.0;  // Target heading to maintain
-unsigned long lastGyroT = 0, lastPIDT = 0;
-const int PID_INT = 20;
-
-long lastRC = 0, lastLC = 0;
-
-// ========== ISR ==========
+// ========== ENCODERS ==========
 void cntR() {
   int a = digitalRead(encAR);
   int b = digitalRead(encBR);
@@ -60,12 +74,12 @@ void cntL() {
   lastAL = a;
 }
 
-// ========== Motor ==========
+// ========== MOTORS ==========
 void setMotors(int l, int r) {
-  l = constrain(l, -maxSpd, maxSpd);
-  r = constrain(r, -maxSpd, maxSpd);
+  l = constrain(l, -MAX_SPEED, MAX_SPEED);
+  r = constrain(r, -MAX_SPEED, MAX_SPEED);
   
-  // Left
+  // LEFT MOTOR (ENB, IN3, IN4)
   if (l >= 0) {
     digitalWrite(IN3, HIGH);
     digitalWrite(IN4, LOW);
@@ -76,7 +90,7 @@ void setMotors(int l, int r) {
     analogWrite(ENB, -l);
   }
   
-  // Right (reversed)
+  // RIGHT MOTOR (ENA, IN1, IN2)
   if (r >= 0) {
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, HIGH);
@@ -93,278 +107,207 @@ void stopMotors() {
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
-  spdErrSum = 0;
-  hdgErrSum = 0;
-  spdErrLast = 0;
-  hdgErrLast = 0;
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
 }
 
-// ========== Gyro ==========
-void updHdg() {
-  if (!imuOK) return;
-  
-  sensors_event_t a, g, t;
-  imu.getEvent(&a, &g, &t);
-  
-  unsigned long now = millis();
-  float dt = (now - lastGyroT) / 1000.0;
-  
-  if (lastGyroT > 0 && dt < 1.0) {  // Increased from 0.1 to 1.0 second max
-    heading += g.gyro.z * 57.2958 * dt;
-    
-    // Normalize heading to [-180, 180]
-    while (heading > 180) heading -= 360;
-    while (heading < -180) heading += 360;
-  }
-  lastGyroT = now;
+// ========== WAIT FUNCTION ==========
+void wait(float seconds) {
+  delay((int)(seconds * 1000));
 }
 
-// ========== PID ==========
-void runPID() {
-  unsigned long now = millis();
-  if (now - lastPIDT < PID_INT) return;
+// ========== GO STRAIGHT - YOUR ORIGINAL CODE ==========
+void goStraight(float distance_mm) {
+  long target = (long)(distance_mm / mm_per_tick);
   
-  float dt = (now - lastPIDT) / 1000.0;
-  lastPIDT = now;
+  rCnt = 0;
+  lCnt = 0;
+  error_sum = 0;
+  last_error = 0;
   
-  updHdg();
+  unsigned long last_update = millis();
   
-  long rDelta = rCnt - lastRC;
-  long lDelta = lCnt - lastLC;
-  lastRC = rCnt;
-  lastLC = lCnt;
-  
-  // Speed PID
-  spdErr = rDelta - lDelta;
-  spdErrSum += spdErr * dt;
-  spdErrSum = constrain(spdErrSum, -100, 100);
-  float spdD = (spdErr - spdErrLast) / dt;
-  spdErrLast = spdErr;
-  float spdCorr = Kp_spd * spdErr + Ki_spd * spdErrSum + Kd_spd * spdD;
-  
-  // Heading PID - track error from target heading
-  hdgErr = targetHeading - heading;
-  // Wrap error to [-180, 180]
-  while (hdgErr > 180) hdgErr -= 360;
-  while (hdgErr < -180) hdgErr += 360;
-  
-  hdgErrSum += hdgErr * dt;
-  hdgErrSum = constrain(hdgErrSum, -100, 100);  // Increased integral limit
-  float hdgD = (hdgErr - hdgErrLast) / dt;
-  hdgErrLast = hdgErr;
-  float hdgCorr = Kp_hdg * hdgErr + Ki_hdg * hdgErrSum + Kd_hdg * hdgD;
-  
-  int l = baseSpd + spdCorr/2 + hdgCorr;
-  int r = baseSpd + rightBias - spdCorr/2 - hdgCorr;  // Add bias to right motor
-  
-  setMotors(l, r);
-}
-
-// ========== Turn ==========
-void turnLeft(float degrees, int spd = 120) {
-  baseSpd = spd;
-  rCnt = lCnt = 0;
-  lastRC = lastLC = 0;
-  float startHeading = heading;
-  lastGyroT = millis();
-  lastPIDT = millis();
-  
-  spdErrSum = hdgErrSum = 0;
-  spdErrLast = hdgErrLast = 0;
-  
-  Serial.print("TURN LEFT ");
-  Serial.print(degrees);
-  Serial.print(" from ");
-  Serial.println(startHeading);
-  
-  // Track total rotation
-  float rotated = 0;
-  float lastHeading = heading;
-  
-  // Turn in place with proportional speed control
-  while (rotated < degrees - 1.0) {
-    updHdg();
+  while (abs(rCnt) < target && abs(lCnt) < target) {
     
-    // Calculate change in heading, handling wrap-around
-    float delta = heading - lastHeading;
-    if (delta > 180) delta -= 360;
-    if (delta < -180) delta += 360;
-    rotated += delta;
-    lastHeading = heading;
+    // Calculate position error
+    long position_error = lCnt - rCnt;  // Positive = left is ahead
     
-    float remaining = degrees - rotated;
-    int turnSpd = spd;
-    
-    // Slow down in last 15 degrees
-    if (remaining < 15) {
-      turnSpd = max(60, (int)(spd * remaining / 15.0));
+    // Check if we're outside tolerance
+    if (abs(position_error) > POSITION_TOLERANCE) {
+      // We're drifting apart - correct aggressively
+      
+      // Time-based PID
+      unsigned long now = millis();
+      float dt = (now - last_update) / 1000.0;
+      last_update = now;
+      
+      if (dt > 0) {
+        error_sum += position_error * dt;
+        error_sum = constrain(error_sum, -100, 100);
+        
+        float derivative = (position_error - last_error) / dt;
+        last_error = position_error;
+        
+        float correction = KP * position_error + KI * error_sum + KD * derivative;
+        
+        // Apply correction
+        int left_speed = BASE_SPEED - correction;
+        int right_speed = BASE_SPEED + correction;
+        
+        setMotors(left_speed, right_speed);
+      }
+    } else {
+      // Within tolerance - just go at base speed
+      setMotors(BASE_SPEED, BASE_SPEED);
+      last_error = position_error;
     }
     
-    setMotors(turnSpd+10, -turnSpd - rightBias/2-10);
-    delay(1);
+    delay(5);  // Check very frequently (every 5ms)
   }
   
   stopMotors();
-  delay(50);  // Let it settle
-  
-  // Normalize and update target heading
-  while (heading > 180) heading -= 360;
-  while (heading < -180) heading += 360;
-  targetHeading = heading;
-  
-  Serial.print("Done Hdg:");
-  Serial.print(heading);
-  Serial.print(" Target:");
-  Serial.println(targetHeading);
+  delay(500);
 }
 
-void turnRight(float degrees, int spd = 120) {
-  baseSpd = spd;
-  rCnt = lCnt = 0;
-  lastRC = lastLC = 0;
-  float startHeading = heading;
-  lastGyroT = millis();
-  lastPIDT = millis();
+// ========== TURN RIGHT - YOUR ORIGINAL CODE ==========
+void turnRight(float degrees) {
+  // In-place turn: left wheel forward, right wheel backward
+  float turn_circumference = PI * WHEEL_BASE_MM;
+  float arc_distance = (degrees / 360.0) * turn_circumference * TURN_MULTIPLIER_RIGHT;
+  long target_ticks = (long)(arc_distance / mm_per_tick);
   
-  spdErrSum = hdgErrSum = 0;
-  spdErrLast = hdgErrLast = 0;
+  rCnt = 0;
+  lCnt = 0;
+  error_sum = 0;
+  last_error = 0;
   
-  Serial.print("TURN RIGHT ");
-  Serial.print(degrees);
-  Serial.print(" from ");
-  Serial.println(startHeading);
+  unsigned long start_time = millis();
+  unsigned long last_update = millis();
   
-  // Track total rotation
-  float rotated = 0;
-  float lastHeading = heading;
-  
-  // Turn in place with proportional speed control
-  while (rotated < degrees - 1.0) {
-    updHdg();
+  // Keep turning until BOTH wheels reach target
+  while (abs(lCnt) < target_ticks || abs(rCnt) < target_ticks) {
+    unsigned long elapsed = millis() - start_time;
+    long avg_ticks = (abs(lCnt) + abs(rCnt)) / 2;
+    long remaining = target_ticks - avg_ticks;
     
-    // Calculate change in heading, handling wrap-around
-    float delta = lastHeading - heading;
-    if (delta > 180) delta -= 360;
-    if (delta < -180) delta += 360;
-    rotated += delta;
-    lastHeading = heading;
+    // Ramp speed up and down
+    int current_speed = TURN_SPEED_MAX;
     
-    float remaining = degrees - rotated;
-    int turnSpd = spd;
-    
-    // Slow down in last 15 degrees
-    if (remaining < 15) {
-      turnSpd = max(60, (int)(spd * remaining / 15.0));
+    // Acceleration
+    if (elapsed < TURN_ACCEL_MS) {
+      current_speed = map(elapsed, 0, TURN_ACCEL_MS, TURN_SPEED_MIN, TURN_SPEED_MAX);
+      current_speed = constrain(current_speed, TURN_SPEED_MIN, TURN_SPEED_MAX);
     }
     
-    setMotors(-turnSpd-10,(turnSpd + rightBias/2)+10);
-    delay(1);
-  }
-  
-  stopMotors();
-  delay(50);  // Let it settle
-  
-  // Normalize and update target heading
-  while (heading > 180) heading -= 360;
-  while (heading < -180) heading += 360;
-  targetHeading = heading;
-  
-  Serial.print("Done Hdg:");
-  Serial.print(heading);
-  Serial.print(" Target:");
-  Serial.println(targetHeading);
-}
-
-void stop() {
-  stopMotors();
-  Serial.println("STOPPED");
-}
-
-// ========== Drive ==========
-void go(long ticks, int spd = 160) {
-  baseSpd = spd;
-  rCnt = lCnt = 0;
-  lastRC = lastLC = 0;
-  // Don't reset heading - maintain continuous tracking
-  lastGyroT = millis();
-  lastPIDT = millis();
-  unsigned long start = millis();
-  
-  spdErrSum = hdgErrSum = 0;
-  spdErrLast = hdgErrLast = 0;
-  
-  Serial.print("GO - Target Hdg: ");
-  Serial.println(targetHeading);
-  
-  while (abs(rCnt) < ticks && abs(lCnt) < ticks) {
-    if (millis() - start < startDur) {
-      setMotors(startBoost, startBoost + rightBias);
-      updHdg();  // Still track heading during boost!
-      delay(1);
-      continue;
+    // Deceleration
+    if (remaining < TURN_DECEL_TICKS) {
+      int decel_speed = map(remaining, 0, TURN_DECEL_TICKS, TURN_SPEED_MIN, TURN_SPEED_MAX);
+      current_speed = min(current_speed, decel_speed);
+      current_speed = constrain(current_speed, TURN_SPEED_MIN, TURN_SPEED_MAX);
     }
-    runPID();
-    delay(1);
+    
+    // Sync correction: both wheels should travel same distance
+    long position_error = abs(lCnt) - abs(rCnt);
+    
+    unsigned long now = millis();
+    float dt = (now - last_update) / 1000.0;
+    last_update = now;
+    
+    if (dt > 0) {
+      error_sum += position_error * dt;
+      error_sum = constrain(error_sum, -50, 50);
+      
+      float derivative = (position_error - last_error) / dt;
+      last_error = position_error;
+      
+      float correction = 3.0 * position_error + 0.4 * error_sum + 0.8 * derivative;
+      correction = constrain(correction, -50, 50);
+      
+      // RIGHT TURN: Left backward (-), Right forward (+) - SWAPPED!
+      int left_speed = -(current_speed + correction);  // Left goes BACKWARD
+      int right_speed = (current_speed - correction) * RIGHT_MOTOR_BIAS;  // Right goes FORWARD with boost
+      
+      setMotors(left_speed, right_speed);
+    }
+    
+    delay(10);
   }
   
   stopMotors();
-  
-  Serial.print("Done L:");
-  Serial.print(lCnt);
-  Serial.print(" R:");
-  Serial.print(rCnt);
-  Serial.print(" Hdg:");
-  Serial.print(heading);
-  Serial.print(" Target:");
-  Serial.println(targetHeading);
+  delay(1000);
 }
 
-// ========== Setup ==========
+// ========== TURN LEFT - YOUR ORIGINAL CODE WITH POWER BOOST ==========
+void turnLeft(float degrees) {
+  // In-place turn: left wheel backward, right wheel forward
+  float turn_circumference = PI * WHEEL_BASE_MM;
+  float arc_distance = (degrees / 360.0) * turn_circumference * TURN_MULTIPLIER_LEFT;
+  long target_ticks = (long)(arc_distance / mm_per_tick);
+  
+  rCnt = 0;
+  lCnt = 0;
+  error_sum = 0;
+  last_error = 0;
+  
+  unsigned long start_time = millis();
+  unsigned long last_update = millis();
+  
+  // Keep turning until BOTH wheels reach target
+  while (abs(lCnt) < target_ticks || abs(rCnt) < target_ticks) {
+    unsigned long elapsed = millis() - start_time;
+    long avg_ticks = (abs(lCnt) + abs(rCnt)) / 2;
+    long remaining = target_ticks - avg_ticks;
+    
+    // Ramp speed up and down - USING BOOSTED SPEEDS
+    int current_speed = LEFT_TURN_SPEED_MAX;
+    
+    // Acceleration
+    if (elapsed < TURN_ACCEL_MS) {
+      current_speed = map(elapsed, 0, TURN_ACCEL_MS, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
+      current_speed = constrain(current_speed, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
+    }
+    
+    // Deceleration
+    if (remaining < TURN_DECEL_TICKS) {
+      int decel_speed = map(remaining, 0, TURN_DECEL_TICKS, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
+      current_speed = min(current_speed, decel_speed);
+      current_speed = constrain(current_speed, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
+    }
+    
+    // Sync correction: both wheels should travel same distance
+    long position_error = abs(lCnt) - abs(rCnt);
+    
+    unsigned long now = millis();
+    float dt = (now - last_update) / 1000.0;
+    last_update = now;
+    
+    if (dt > 0) {
+      error_sum += position_error * dt;
+      error_sum = constrain(error_sum, -50, 50);
+      
+      float derivative = (position_error - last_error) / dt;
+      last_error = position_error;
+      
+      float correction = 3.0 * position_error + 0.4 * error_sum + 0.8 * derivative;
+      correction = constrain(correction, -50, 50);
+      
+      // LEFT TURN: Left forward (+), Right backward (-)
+      // Since right motor is weaker, when it goes backward it needs the bias
+      int left_speed = (current_speed + correction);  // Left goes FORWARD
+      int right_speed = -(current_speed - correction) * RIGHT_MOTOR_BIAS;  // Right goes BACKWARD with boost
+      
+      setMotors(left_speed, right_speed);
+    }
+    
+    delay(10);
+  }
+  
+  stopMotors();
+  delay(1000);
+}
+
+// ========== SETUP ==========
 void setup() {
-  Serial.begin(115200);
-  while (!Serial) delay(10);
-  
-  Serial.println("PID Control");
-  
-  // I2C scan
-  Wire.begin();
-  for (byte i = 1; i < 127; i++) {
-    Wire.beginTransmission(i);
-    if (Wire.endTransmission() == 0) {
-      Serial.print("I2C: 0x");
-      Serial.println(i, HEX);
-    }
-  }
-  
-  // IMU init
-  if (imu.begin_I2C(0x6A)) {
-    Serial.println("IMU OK at 0x6A");
-    imu.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
-    imu.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
-    imu.setAccelDataRate(LSM6DS_RATE_104_HZ);
-    imu.setGyroDataRate(LSM6DS_RATE_104_HZ);
-    imuOK = true;
-    
-    Serial.println("Calibrating gyro - keep robot still...");
-    delay(1000);
-    Serial.println("Calibration done!");
-  } else if (imu.begin_I2C()) {
-    Serial.println("IMU OK at default");
-    imu.setAccelRange(LSM6DS_ACCEL_RANGE_2_G);
-    imu.setGyroRange(LSM6DS_GYRO_RANGE_250_DPS);
-    imu.setAccelDataRate(LSM6DS_RATE_104_HZ);
-    imu.setGyroDataRate(LSM6DS_RATE_104_HZ);
-    imuOK = true;
-    
-    Serial.println("Calibrating gyro - keep robot still...");
-    delay(1000);
-    Serial.println("Calibration done!");
-  } else {
-    Serial.println("IMU FAIL - encoder only");
-    imuOK = false;
-  }
-  
-  // Pins
   pinMode(encAL, INPUT_PULLUP);
   pinMode(encBL, INPUT_PULLUP);
   pinMode(encAR, INPUT_PULLUP);
@@ -379,39 +322,86 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(encAR), cntR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encAL), cntL, CHANGE);
   
-  Serial.println("Ready");
+  stopMotors();
+  
+  float wheel_circumference = PI * WHEEL_DIAMETER_MM;
+  mm_per_tick = wheel_circumference / PULSES_PER_REV;
+  
+  delay(3000);
 }
 
-// ========== Loop ==========
+// ========== LOOP ==========
 void loop() {
-  // Encoder test mode - uncomment to debug
+  // Example usage:
+  int T = 500*1.0;//calibrate
+  goStraight(3.5*T);
+  wait(1);             // wait 2 seconds
+  turnRight(90);       // 90° right
+  wait(1);  
+  turnRight(90);       // 90° right
+  wait(1);  
+  turnRight(90);       // 90° right
+  wait(1);  
+  turnRight(90);       // 90° right
+  wait(1);  
   /*
-  Serial.print("L A:");
-  Serial.print(digitalRead(encAL));
-  Serial.print(" B:");
-  Serial.print(digitalRead(encBL));
-  Serial.print(" | R A:");
-  Serial.print(digitalRead(encAR));
-  Serial.print(" B:");
-  Serial.print(digitalRead(encBR));
-  Serial.print(" | Counts L:");
-  Serial.print(lCnt);
-  Serial.print(" R:");
-  Serial.println(rCnt);
-  delay(100);
-  return;
-  */
-  
-  // Example sequence - customize as needed
-  for(int i = 0; i<4; i++){
-  go(3000);
-  delay(1000);
-  
-  turnRight(84.5);
-  delay(1000);
-  }
+  goStraight(0.5*T);    // 100cm
+  wait(1);             // wait 2 seconds
+  turnRight(90);       // 90° right
+  wait(1);     
+  turnRight(90);       // 90° right
+  wait(1);     
+  turnRight(90);       // 90° right
+  wait(1);       
+  goStraight(1*T);    // 100cm
+  wait(1);  
+  turnRight(90);       // 90° right
+  wait(1); 
+  goStraight(3*T);   
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1); 
+  goStraight(4*T);   
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1); 
+  goStraight(2*T);   
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1);
+  goStraight(2*T);   
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1);
+  goStraight(1*T);   
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1);
+  goStraight(1*T);
  
   
-  stop();
-  delay(1000);  // Wait 5 seconds before repeating
+
+
+  //FAILING RUNNING THING
+  //goStraight(1000000);
+  */
+
+              // wait 1.5 seconds
+       // 90° left
+        //Potential time waste?
+        /*
+  for(int i = 0; i<=5; i++){
+    turnRight(90);       // 90° right
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1);
+  turnRight(90);       // 90° right
+  wait(1);
+  }
+  */
+  while(true) {
+    delay(1000);
+  }
 }
