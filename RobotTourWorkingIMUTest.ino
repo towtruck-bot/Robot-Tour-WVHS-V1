@@ -3,11 +3,11 @@
 
 // ========== CALIBRATION ==========
 const float WHEEL_DIAMETER_MM = 60.325;
-const int PULSES_PER_REV = 435;
+const int PULSES_PER_REV = 14*50;
 const float WHEEL_BASE_MM = 113.5;  // NEW: Updated wheel-to-wheel diameter
 
 // Straight driving - YOUR ORIGINAL SETTINGS with 95 speed
-const int BASE_SPEED = 95;
+const int BASE_SPEED = 125;
 const int MAX_SPEED = 255;
 
 // Straight PID - YOUR ORIGINAL
@@ -25,7 +25,7 @@ const int LEFT_TURN_SPEED_MAX = 200;
 const int LEFT_TURN_SPEED_MIN = 160;
 
 // Motor bias - YOUR ORIGINAL
-const float RIGHT_MOTOR_BIAS = 1.15;
+const float RIGHT_MOTOR_BIAS = 0.98;
 
 // Turn calibration multipliers (adjusted for 113.5mm wheelbase)
 const float TURN_MULTIPLIER_RIGHT = 0.626;  // Adjusted: 0.643 * (113.5/110.5)
@@ -49,7 +49,7 @@ const int TURN_DECEL_TICKS = 30;
 
 // ========== STATE ==========
 volatile long rCnt = 0, lCnt = 0;
-volatile int lastAR = LOW, lastAL = LOW;
+//volatile int lastAR = LOW, lastAL = LOW;
 
 float mm_per_tick;
 float error_sum = 0;
@@ -57,29 +57,39 @@ float last_error = 0;
 
 // ========== ENCODERS ==========
 void cntR() {
+  static int lastAR = 0;
   int a = digitalRead(encAR);
   int b = digitalRead(encBR);
   if (a != lastAR) {
     (a == HIGH) ? ((b == LOW) ? rCnt-- : rCnt++) : ((b == HIGH) ? rCnt-- : rCnt++);
   }
+  //Serial.print("rCnt:");
+  //Serial.println(rCnt);
   lastAR = a;
 }
 
 void cntL() {
+  static int lastAL = 0;
   int a = digitalRead(encAL);
   int b = digitalRead(encBL);
   if (a != lastAL) {
     (a == HIGH) ? ((b == LOW) ? lCnt++ : lCnt--) : ((b == HIGH) ? lCnt++ : lCnt--);
   }
+  
+  //Serial.print("lCnt:");
+ // Serial.println(lCnt);
   lastAL = a;
 }
 
 // ========== MOTORS ==========
 void setMotors(int l, int r) {
+  Serial.print(l);
+  Serial.print("      ");
+  Serial.println(r);
   l = constrain(l, -MAX_SPEED, MAX_SPEED);
   r = constrain(r, -MAX_SPEED, MAX_SPEED);
   
-  // LEFT MOTOR (ENB, IN3, IN4)
+  // LEFT-->right- MOTOR (ENB, IN3, IN4)
   if (l >= 0) {
     digitalWrite(IN3, HIGH);
     digitalWrite(IN4, LOW);
@@ -90,7 +100,7 @@ void setMotors(int l, int r) {
     analogWrite(ENB, -l);
   }
   
-  // RIGHT MOTOR (ENA, IN1, IN2)
+  // RIGHT -->left MOTOR (ENA, IN1, IN2)
   if (r >= 0) {
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, HIGH);
@@ -133,7 +143,7 @@ void goStraight(float distance_mm) {
     long position_error = lCnt - rCnt;  // Positive = left is ahead
     
     // Check if we're outside tolerance
-    if (abs(position_error) > POSITION_TOLERANCE) {
+    if (abs(position_error) > POSITION_TOLERANCE&&false) {
       // We're drifting apart - correct aggressively
       
       // Time-based PID
@@ -153,12 +163,13 @@ void goStraight(float distance_mm) {
         // Apply correction
         int left_speed = BASE_SPEED - correction;
         int right_speed = BASE_SPEED + correction;
+        right_speed = (int)((float)right_speed*RIGHT_MOTOR_BIAS);
         
         setMotors(left_speed, right_speed);
       }
     } else {
       // Within tolerance - just go at base speed
-      setMotors(BASE_SPEED, BASE_SPEED);
+      setMotors(BASE_SPEED*RIGHT_MOTOR_BIAS, BASE_SPEED);
       last_error = position_error;
     }
     
@@ -326,81 +337,18 @@ void setup() {
   
   float wheel_circumference = PI * WHEEL_DIAMETER_MM;
   mm_per_tick = wheel_circumference / PULSES_PER_REV;
-  
-  delay(3000);
+  Serial.begin(115200);
 }
 
 // ========== LOOP ==========
 void loop() {
   // Example usage:
-  int T = 500*1.0;//calibrate
-  goStraight(3.5*T);
-  wait(1);             // wait 2 seconds
-  turnRight(90);       // 90° right
-  wait(1);  
-  turnRight(90);       // 90° right
-  wait(1);  
-  turnRight(90);       // 90° right
-  wait(1);  
-  turnRight(90);       // 90° right
-  wait(1);  
-  /*
-  goStraight(0.5*T);    // 100cm
-  wait(1);             // wait 2 seconds
-  turnRight(90);       // 90° right
-  wait(1);     
-  turnRight(90);       // 90° right
-  wait(1);     
-  turnRight(90);       // 90° right
-  wait(1);       
-  goStraight(1*T);    // 100cm
-  wait(1);  
-  turnRight(90);       // 90° right
-  wait(1); 
-  goStraight(3*T);   
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1); 
-  goStraight(4*T);   
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1); 
-  goStraight(2*T);   
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1);
-  goStraight(2*T);   
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1);
-  goStraight(1*T);   
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1);
-  goStraight(1*T);
+  int T = 100*1.0;//calibrate
+  goStraight(T);
+  Serial.print(rCnt);
+  Serial.print("-");
+  Serial.println(lCnt);
  
-  
-
-
-  //FAILING RUNNING THING
-  //goStraight(1000000);
-  */
-
-              // wait 1.5 seconds
-       // 90° left
-        //Potential time waste?
-        /*
-  for(int i = 0; i<=5; i++){
-    turnRight(90);       // 90° right
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1);
-  turnRight(90);       // 90° right
-  wait(1);
-  }
-  */
   while(true) {
     delay(1000);
   }
