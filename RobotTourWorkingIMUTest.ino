@@ -1,39 +1,36 @@
-// ========== COMBINED ROBOT CONTROL ==========
-// Adjusted for 113.5mm wheel-to-wheel diameter
-
-// ========== CALIBRATION ==========
+// ========== CALIBRATION CONSTANTS ==========
 const float WHEEL_DIAMETER_MM = 60.325;
-const int PULSES_PER_REV = 14*50;
-const float WHEEL_BASE_MM = 113.5;  // NEW: Updated wheel-to-wheel diameter
+const int PULSES_PER_REV = 14 * 50;  // 700 pulses per revolution
+const float WHEEL_BASE_MM = 113.5;
 
-// Straight driving - YOUR ORIGINAL SETTINGS with 95 speed
-const int BASE_SPEED = 125;
+// Speed settings
 const int MAX_SPEED = 255;
+const int CRUISE_SPEED = 125;
+const int MIN_SPEED = 70;
+const int TURN_SPEED = 140;
 
-// Straight PID - YOUR ORIGINAL
-const float KP = 8.0;
-const float KI = 0.5;
-const float KD = 2.0;
-const int POSITION_TOLERANCE = 2;
+// Acceleration/Deceleration
+const int ACCEL_TIME_MS = 400;        // Time to reach cruise speed
+const float DECEL_START_MM = 100.0;    // Start slowing down this far from target
+const int TURN_ACCEL_MS = 300;
+const float TURN_DECEL_DEGREES = 15.0; // Start slowing this many degrees before target
 
-// Turn speed - BOOSTED for left turn
-const int TURN_SPEED_MAX = 140;
-const int TURN_SPEED_MIN = 110;
+// Motor correction
+const float RIGHT_MOTOR_BIAS = 0.98;  // Your existing bias
 
-// Left turn boost - extra power
-const int LEFT_TURN_SPEED_MAX = 200;
-const int LEFT_TURN_SPEED_MIN = 160;
+// PID for straight driving
+const float KP_STRAIGHT = 16.0;        // Much more aggressive correction
+const float KI_STRAIGHT = 2.5;        // Strong integral to fight motor differences
+const float KD_STRAIGHT = 2.0;        // Damping
 
-// Motor bias - YOUR ORIGINAL
-const float RIGHT_MOTOR_BIAS = 0.98;
+// PID for turning (sync both wheels)
+const float KP_TURN = 3.0;
+const float KI_TURN = 0.8;
+const float KD_TURN = 1.0;
 
-// Turn calibration multipliers (adjusted for 113.5mm wheelbase)
-const float TURN_MULTIPLIER_RIGHT = 0.626;  // Adjusted: 0.643 * (113.5/110.5)
-const float TURN_MULTIPLIER_LEFT = 0.52;   // Adjusted: 0.6365 * (113.5/110.5)
-
-// Ramping - YOUR ORIGINAL
-const int TURN_ACCEL_MS = 400;
-const int TURN_DECEL_TICKS = 30;
+// Turn calibration
+const float TURN_MULTIPLIER_RIGHT = 0.626;
+const float TURN_MULTIPLIER_LEFT = 0.52;
 
 // ========== PINS ==========
 #define encAL 2
@@ -49,13 +46,12 @@ const int TURN_DECEL_TICKS = 30;
 
 // ========== STATE ==========
 volatile long rCnt = 0, lCnt = 0;
-//volatile int lastAR = LOW, lastAL = LOW;
-
 float mm_per_tick;
 float error_sum = 0;
 float last_error = 0;
+unsigned long last_pid_time = 0;
 
-// ========== ENCODERS ==========
+// ========== ENCODER ISR ==========
 void cntR() {
   static int lastAR = 0;
   int a = digitalRead(encAR);
@@ -63,8 +59,6 @@ void cntR() {
   if (a != lastAR) {
     (a == HIGH) ? ((b == LOW) ? rCnt-- : rCnt++) : ((b == HIGH) ? rCnt-- : rCnt++);
   }
-  //Serial.print("rCnt:");
-  //Serial.println(rCnt);
   lastAR = a;
 }
 
@@ -75,21 +69,15 @@ void cntL() {
   if (a != lastAL) {
     (a == HIGH) ? ((b == LOW) ? lCnt++ : lCnt--) : ((b == HIGH) ? lCnt++ : lCnt--);
   }
-  
-  //Serial.print("lCnt:");
- // Serial.println(lCnt);
   lastAL = a;
 }
 
-// ========== MOTORS ==========
+// ========== MOTOR CONTROL ==========
 void setMotors(int l, int r) {
-  Serial.print(l);
-  Serial.print("      ");
-  Serial.println(r);
   l = constrain(l, -MAX_SPEED, MAX_SPEED);
   r = constrain(r, -MAX_SPEED, MAX_SPEED);
   
-  // LEFT-->right- MOTOR (ENB, IN3, IN4)
+  // Left motor (ENB, IN3, IN4)
   if (l >= 0) {
     digitalWrite(IN3, HIGH);
     digitalWrite(IN4, LOW);
@@ -100,7 +88,7 @@ void setMotors(int l, int r) {
     analogWrite(ENB, -l);
   }
   
-  // RIGHT -->left MOTOR (ENA, IN1, IN2)
+  // Right motor (ENA, IN1, IN2)
   if (r >= 0) {
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, HIGH);
@@ -119,206 +107,272 @@ void stopMotors() {
   digitalWrite(IN4, LOW);
   analogWrite(ENA, 0);
   analogWrite(ENB, 0);
+  
+  // Reset PID state
+  error_sum = 0;
+  last_error = 0;
+  last_pid_time = 0;
 }
 
-// ========== WAIT FUNCTION ==========
-void wait(float seconds) {
-  delay((int)(seconds * 1000));
+// ========== SPEED RAMPING ==========
+int getRampedSpeed(unsigned long elapsed_ms, float remaining_mm, int cruise_speed, int min_speed) {
+  // Acceleration phase
+  int accel_speed = map(elapsed_ms, 0, ACCEL_TIME_MS, min_speed, cruise_speed);
+  accel_speed = constrain(accel_speed, min_speed, cruise_speed);
+  
+  // Deceleration phase
+  int decel_speed = cruise_speed;
+  if (remaining_mm < DECEL_START_MM) {
+    decel_speed = map((int)remaining_mm, 0, (int)DECEL_START_MM, min_speed, cruise_speed);
+    decel_speed = constrain(decel_speed, min_speed, cruise_speed);
+  }
+  
+  // Return whichever is slower (smoother)
+  return min(accel_speed, decel_speed);
 }
 
-// ========== GO STRAIGHT - YOUR ORIGINAL CODE ==========
+int getTurnRampedSpeed(unsigned long elapsed_ms, float remaining_degrees, int cruise_speed, int min_speed, int accel_ms, float decel_degrees) {
+  // Acceleration phase
+  int accel_speed = map(elapsed_ms, 0, accel_ms, min_speed, cruise_speed);
+  accel_speed = constrain(accel_speed, min_speed, cruise_speed);
+  
+  // Deceleration phase
+  int decel_speed = cruise_speed;
+  if (remaining_degrees < decel_degrees) {
+    decel_speed = map((int)remaining_degrees, 0, (int)decel_degrees, min_speed, cruise_speed);
+    decel_speed = constrain(decel_speed, min_speed, cruise_speed);
+  }
+  
+  return min(accel_speed, decel_speed);
+}
+
+// ========== GO STRAIGHT ==========
 void goStraight(float distance_mm) {
-  long target = (long)(distance_mm / mm_per_tick);
+  long target_ticks = (long)(distance_mm / mm_per_tick);
+  
+  Serial.print("GO ");
+  Serial.print(distance_mm);
+  Serial.print("mm (");
+  Serial.print(target_ticks);
+  Serial.println(" ticks)");
   
   rCnt = 0;
   lCnt = 0;
   error_sum = 0;
   last_error = 0;
+  last_pid_time = millis();
   
-  unsigned long last_update = millis();
+  unsigned long start_time = millis();
   
-  while (abs(rCnt) < target && abs(lCnt) < target) {
+  while (abs(rCnt) < target_ticks && abs(lCnt) < target_ticks) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - start_time;
+    float dt = (now - last_pid_time) / 1000.0;
+    last_pid_time = now;
     
-    // Calculate position error
+    // Calculate remaining distance
+    long avg_ticks = (abs(rCnt) + abs(lCnt)) / 2;
+    long remaining_ticks = target_ticks - avg_ticks;
+    float remaining_mm = remaining_ticks * mm_per_tick;
+    
+    // Get ramped speed
+    int base_speed = getRampedSpeed(elapsed, remaining_mm, CRUISE_SPEED, MIN_SPEED);
+    
+    // PID to keep motors synchronized
     long position_error = lCnt - rCnt;  // Positive = left is ahead
     
-    // Check if we're outside tolerance
-    if (abs(position_error) > POSITION_TOLERANCE&&false) {
-      // We're drifting apart - correct aggressively
+    if (dt > 0 && dt < 0.1) {  // Sanity check on dt
+      error_sum += position_error * dt;
+      error_sum = constrain(error_sum, -300, 300);  // Even larger integral limit
       
-      // Time-based PID
-      unsigned long now = millis();
-      float dt = (now - last_update) / 1000.0;
-      last_update = now;
-      
-      if (dt > 0) {
-        error_sum += position_error * dt;
-        error_sum = constrain(error_sum, -100, 100);
-        
-        float derivative = (position_error - last_error) / dt;
-        last_error = position_error;
-        
-        float correction = KP * position_error + KI * error_sum + KD * derivative;
-        
-        // Apply correction
-        int left_speed = BASE_SPEED - correction;
-        int right_speed = BASE_SPEED + correction;
-        right_speed = (int)((float)right_speed*RIGHT_MOTOR_BIAS);
-        
-        setMotors(left_speed, right_speed);
-      }
-    } else {
-      // Within tolerance - just go at base speed
-      setMotors(BASE_SPEED*RIGHT_MOTOR_BIAS, BASE_SPEED);
+      float derivative = (position_error - last_error) / dt;
       last_error = position_error;
+      
+      float correction = KP_STRAIGHT * position_error + 
+                        KI_STRAIGHT * error_sum + 
+                        KD_STRAIGHT * derivative;
+      
+      // Important: Apply correction SYMMETRICALLY to both motors
+      // Don't apply bias inside the PID loop
+      int left_speed = base_speed - (correction / 2);
+      int right_speed = base_speed + (correction / 2);
+      
+      // Apply bias AFTER PID correction
+      right_speed = right_speed * RIGHT_MOTOR_BIAS;
+      
+      setMotors(left_speed, right_speed);
     }
     
-    delay(5);  // Check very frequently (every 5ms)
+    delay(5);  // Fast 5ms loop
   }
   
   stopMotors();
+  
+  Serial.print("Done. L:");
+  Serial.print(lCnt);
+  Serial.print(" R:");
+  Serial.print(rCnt);
+  Serial.print(" Diff:");
+  Serial.println(lCnt - rCnt);
+  
   delay(500);
 }
 
-// ========== TURN RIGHT - YOUR ORIGINAL CODE ==========
+// ========== TURN RIGHT ==========
 void turnRight(float degrees) {
-  // In-place turn: left wheel forward, right wheel backward
   float turn_circumference = PI * WHEEL_BASE_MM;
   float arc_distance = (degrees / 360.0) * turn_circumference * TURN_MULTIPLIER_RIGHT;
   long target_ticks = (long)(arc_distance / mm_per_tick);
   
+  Serial.print("TURN RIGHT ");
+  Serial.print(degrees);
+  Serial.print("° (");
+  Serial.print(target_ticks);
+  Serial.println(" ticks)");
+  
   rCnt = 0;
   lCnt = 0;
   error_sum = 0;
   last_error = 0;
+  last_pid_time = millis();
   
   unsigned long start_time = millis();
-  unsigned long last_update = millis();
   
-  // Keep turning until BOTH wheels reach target
+  // Right turn: Left forward, Right backward
   while (abs(lCnt) < target_ticks || abs(rCnt) < target_ticks) {
-    unsigned long elapsed = millis() - start_time;
-    long avg_ticks = (abs(lCnt) + abs(rCnt)) / 2;
-    long remaining = target_ticks - avg_ticks;
-    
-    // Ramp speed up and down
-    int current_speed = TURN_SPEED_MAX;
-    
-    // Acceleration
-    if (elapsed < TURN_ACCEL_MS) {
-      current_speed = map(elapsed, 0, TURN_ACCEL_MS, TURN_SPEED_MIN, TURN_SPEED_MAX);
-      current_speed = constrain(current_speed, TURN_SPEED_MIN, TURN_SPEED_MAX);
-    }
-    
-    // Deceleration
-    if (remaining < TURN_DECEL_TICKS) {
-      int decel_speed = map(remaining, 0, TURN_DECEL_TICKS, TURN_SPEED_MIN, TURN_SPEED_MAX);
-      current_speed = min(current_speed, decel_speed);
-      current_speed = constrain(current_speed, TURN_SPEED_MIN, TURN_SPEED_MAX);
-    }
-    
-    // Sync correction: both wheels should travel same distance
-    long position_error = abs(lCnt) - abs(rCnt);
-    
     unsigned long now = millis();
-    float dt = (now - last_update) / 1000.0;
-    last_update = now;
+    unsigned long elapsed = now - start_time;
+    float dt = (now - last_pid_time) / 1000.0;
+    last_pid_time = now;
     
-    if (dt > 0) {
+    // Calculate remaining turn
+    long avg_ticks = (abs(lCnt) + abs(rCnt)) / 2;
+    long remaining_ticks = target_ticks - avg_ticks;
+    float remaining_degrees = (remaining_ticks * mm_per_tick / turn_circumference) * 360.0 / TURN_MULTIPLIER_RIGHT;
+    
+    // Get ramped speed
+    int turn_speed = getTurnRampedSpeed(elapsed, remaining_degrees, TURN_SPEED, MIN_SPEED, TURN_ACCEL_MS, TURN_DECEL_DEGREES);
+    
+    // PID to sync both wheels
+    long position_error = abs(lCnt) - abs(rCnt);  // Both should travel same distance
+    
+    if (dt > 0 && dt < 0.1) {
       error_sum += position_error * dt;
-      error_sum = constrain(error_sum, -50, 50);
+      error_sum = constrain(error_sum, -100, 100);
       
       float derivative = (position_error - last_error) / dt;
       last_error = position_error;
       
-      float correction = 3.0 * position_error + 0.4 * error_sum + 0.8 * derivative;
-      correction = constrain(correction, -50, 50);
+      float correction = KP_TURN * position_error + 
+                        KI_TURN * error_sum + 
+                        KD_TURN * derivative;
       
-      // RIGHT TURN: Left backward (-), Right forward (+) - SWAPPED!
-      int left_speed = -(current_speed + correction);  // Left goes BACKWARD
-      int right_speed = (current_speed - correction) * RIGHT_MOTOR_BIAS;  // Right goes FORWARD with boost
+      // Right turn: left forward, right backward
+      int left_speed = turn_speed + correction;
+      int right_speed = -(turn_speed - correction) * RIGHT_MOTOR_BIAS;
       
       setMotors(left_speed, right_speed);
     }
     
-    delay(10);
+    //delay(5);
   }
   
   stopMotors();
-  delay(1000);
+  
+  Serial.print("Done. L:");
+  Serial.print(lCnt);
+  Serial.print(" R:");
+  Serial.print(rCnt);
+  Serial.print(" Diff:");
+  Serial.println(abs(lCnt) + abs(rCnt) - 2*target_ticks);
+  
+  delay(500);
 }
 
-// ========== TURN LEFT - YOUR ORIGINAL CODE WITH POWER BOOST ==========
+// ========== TURN LEFT ==========
 void turnLeft(float degrees) {
-  // In-place turn: left wheel backward, right wheel forward
   float turn_circumference = PI * WHEEL_BASE_MM;
   float arc_distance = (degrees / 360.0) * turn_circumference * TURN_MULTIPLIER_LEFT;
   long target_ticks = (long)(arc_distance / mm_per_tick);
   
+  Serial.print("TURN LEFT ");
+  Serial.print(degrees);
+  Serial.print("° (");
+  Serial.print(target_ticks);
+  Serial.println(" ticks)");
+  
   rCnt = 0;
   lCnt = 0;
   error_sum = 0;
   last_error = 0;
+  last_pid_time = millis();
   
   unsigned long start_time = millis();
-  unsigned long last_update = millis();
   
-  // Keep turning until BOTH wheels reach target
-  while (abs(lCnt) < target_ticks || abs(rCnt) < target_ticks) {
-    unsigned long elapsed = millis() - start_time;
-    long avg_ticks = (abs(lCnt) + abs(rCnt)) / 2;
-    long remaining = target_ticks - avg_ticks;
-    
-    // Ramp speed up and down - USING BOOSTED SPEEDS
-    int current_speed = LEFT_TURN_SPEED_MAX;
-    
-    // Acceleration
-    if (elapsed < TURN_ACCEL_MS) {
-      current_speed = map(elapsed, 0, TURN_ACCEL_MS, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
-      current_speed = constrain(current_speed, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
-    }
-    
-    // Deceleration
-    if (remaining < TURN_DECEL_TICKS) {
-      int decel_speed = map(remaining, 0, TURN_DECEL_TICKS, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
-      current_speed = min(current_speed, decel_speed);
-      current_speed = constrain(current_speed, LEFT_TURN_SPEED_MIN, LEFT_TURN_SPEED_MAX);
-    }
-    
-    // Sync correction: both wheels should travel same distance
-    long position_error = abs(lCnt) - abs(rCnt);
-    
+  // Left turn: Right forward, Left backward
+  while (abs(rCnt) < target_ticks || abs(lCnt) < target_ticks) {
     unsigned long now = millis();
-    float dt = (now - last_update) / 1000.0;
-    last_update = now;
+    unsigned long elapsed = now - start_time;
+    float dt = (now - last_pid_time) / 1000.0;
+    last_pid_time = now;
     
-    if (dt > 0) {
+    // Calculate remaining turn
+    long avg_ticks = (abs(lCnt) + abs(rCnt)) / 2;
+    long remaining_ticks = target_ticks - avg_ticks;
+    float remaining_degrees = (remaining_ticks * mm_per_tick / turn_circumference) * 360.0 / TURN_MULTIPLIER_LEFT;
+    
+    // Get ramped speed
+    int turn_speed = getTurnRampedSpeed(elapsed, remaining_degrees, TURN_SPEED, MIN_SPEED, TURN_ACCEL_MS, TURN_DECEL_DEGREES);
+    
+    // PID to sync both wheels
+    long position_error = abs(rCnt) - abs(lCnt);  // Both should travel same distance
+    
+    if (dt > 0 && dt < 0.1) {
       error_sum += position_error * dt;
-      error_sum = constrain(error_sum, -50, 50);
+      error_sum = constrain(error_sum, -100, 100);
       
       float derivative = (position_error - last_error) / dt;
       last_error = position_error;
       
-      float correction = 3.0 * position_error + 0.4 * error_sum + 0.8 * derivative;
-      correction = constrain(correction, -50, 50);
+      float correction = KP_TURN * position_error + 
+                        KI_TURN * error_sum + 
+                        KD_TURN * derivative;
       
-      // LEFT TURN: Left forward (+), Right backward (-)
-      // Since right motor is weaker, when it goes backward it needs the bias
-      int left_speed = (current_speed + correction);  // Left goes FORWARD
-      int right_speed = -(current_speed - correction) * RIGHT_MOTOR_BIAS;  // Right goes BACKWARD with boost
+      // Left turn: right forward, left backward
+      int right_speed = (turn_speed + correction) * RIGHT_MOTOR_BIAS;
+      int left_speed = -(turn_speed - correction);
       
       setMotors(left_speed, right_speed);
     }
     
-    delay(10);
+    delay(5);
   }
   
   stopMotors();
-  delay(1000);
+  
+  Serial.print("Done. L:");
+  Serial.print(lCnt);
+  Serial.print(" R:");
+  Serial.print(rCnt);
+  Serial.print(" Diff:");
+  Serial.println(abs(lCnt) + abs(rCnt) - 2*target_ticks);
+  
+  delay(500);
+}
+
+// ========== WAIT ==========
+void wait(float seconds) {
+  delay((int)(seconds * 1000));
 }
 
 // ========== SETUP ==========
 void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  
+ 
+  
+  // Configure pins
   pinMode(encAL, INPUT_PULLUP);
   pinMode(encBL, INPUT_PULLUP);
   pinMode(encAR, INPUT_PULLUP);
@@ -330,26 +384,34 @@ void setup() {
   pinMode(ENA, OUTPUT);
   pinMode(ENB, OUTPUT);
   
+  // Attach interrupts
   attachInterrupt(digitalPinToInterrupt(encAR), cntR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(encAL), cntL, CHANGE);
   
   stopMotors();
   
+  // Calculate conversion factor
   float wheel_circumference = PI * WHEEL_DIAMETER_MM;
   mm_per_tick = wheel_circumference / PULSES_PER_REV;
-  Serial.begin(115200);
+
 }
 
 // ========== LOOP ==========
 void loop() {
-  // Example usage:
-  int T = 100*1.0;//calibrate
-  goStraight(T);
-  Serial.print(rCnt);
-  Serial.print("-");
-  Serial.println(lCnt);
  
-  while(true) {
-    delay(1000);
-  }
+  // Test straight driving with detailed feedback
+  
+  setMotors(-200,212);
+  while(rCnt<1000){Serial.print(rCnt);}
+  setMotors(0,0);
+  delay(1000);
+  Serial.println(" ");
+  Serial.print(lCnt);
+  Serial.print(" - ");
+  Serial.println(rCnt);
+  rCnt =0;
+  lCnt = 0;
+  
+  delay(1000);
+  
 }
